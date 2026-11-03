@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain + components
+        run: rustup component add clippy rustfmt
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: cargo deny (licenses)
+        run: cargo deny check licenses
+      - name: fmt
+        run: cargo fmt --check --all
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
