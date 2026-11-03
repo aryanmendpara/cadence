@@ -18,7 +18,7 @@ cadence <command>
 
   scan <folder>     index audio files into the library
   search <terms>    full-text search over title, artist and album
-  play <file> [s]   play one audio file until it ends (optionally from second s)
+  play <file>...    play files back to back, gaplessly
   help              show this message
 
 The database location can be overridden with CADENCE_DB.";
@@ -38,14 +38,10 @@ fn main() -> Result<()> {
             search(&query)
         }
         Some("play") => {
-            let path = args.get(1).context("play needs an audio file path")?;
-            let from = match args.get(2) {
-                Some(seconds) => seconds
-                    .parse::<u64>()
-                    .context("start time must be seconds")?,
-                None => 0,
-            };
-            play(PathBuf::from(path), from)
+            if args.len() < 2 {
+                bail!("play needs at least one audio file path");
+            }
+            play(args[1..].iter().map(PathBuf::from).collect())
         }
         Some("help" | "-h" | "--help") | None => {
             println!("{USAGE}");
@@ -102,29 +98,41 @@ fn search(query: &str) -> Result<()> {
     Ok(())
 }
 
-/// The M2 harness: play a file through the real engine and report what it says.
-fn play(path: PathBuf, from_seconds: u64) -> Result<()> {
+/// The M2 harness: play files back to back through the real audio path.
+///
+/// A gapless run reports `Playing` for every file and a single `Ended` at the very end; a
+/// broken hand-off would end the first track instead.
+fn play(paths: Vec<PathBuf>) -> Result<()> {
     let player = Player::new().context("starting the audio thread")?;
-    if !player.send(Command::Play(TrackRequest { path, id: 0 })) {
+    let total = paths.len();
+
+    let first = TrackRequest {
+        path: paths[0].clone(),
+        id: 0,
+    };
+    if !player.send(Command::Play(first)) {
         bail!("the audio thread stopped");
     }
-    if from_seconds > 0 && !player.send(Command::Seek(from_seconds * 1_000)) {
-        bail!("the audio thread stopped");
-    }
+    preload(&player, &paths, 1);
 
     let mut duration_ms = None;
     loop {
         match player.recv_timeout(Duration::from_millis(250)) {
             Some(Event::Playing {
-                duration_ms: total, ..
+                id,
+                duration_ms: length,
             }) => {
-                duration_ms = total;
+                duration_ms = length;
+                let label = paths.get(id as usize).map(|p| p.display().to_string());
                 println!(
-                    "playing{}",
-                    total
+                    "[{}/{total}] {}{}",
+                    id + 1,
+                    label.unwrap_or_default(),
+                    length
                         .map(|ms| format!(" ({})", clock(ms)))
                         .unwrap_or_default()
                 );
+                preload(&player, &paths, id as usize + 1);
             }
             Some(Event::Position { ms }) => {
                 let total = duration_ms.map(clock).unwrap_or_else(|| "--:--".into());
@@ -143,6 +151,15 @@ fn play(path: PathBuf, from_seconds: u64) -> Result<()> {
             Some(_) | None => {}
         }
     }
+}
+
+/// Hand the worker the file after `index`; `None` clears a stale one at the end of the list.
+fn preload(player: &Player, paths: &[PathBuf], index: usize) {
+    let request = paths.get(index).map(|path| TrackRequest {
+        path: path.clone(),
+        id: index as u64,
+    });
+    player.send(Command::SetNext(request));
 }
 
 fn clock(ms: u64) -> String {

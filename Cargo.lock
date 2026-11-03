@@ -151,6 +151,11 @@ dependencies = [
 [[package]]
 name = "cadence-engine"
 version = "0.1.0"
+dependencies = [
+ "cadence-audio",
+ "cadence-core",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "cadence-provider-local"

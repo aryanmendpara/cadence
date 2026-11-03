@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Error, Result};
 
@@ -117,6 +117,30 @@ pub struct TrackHit {
     pub duration_ms: Option<i64>,
 }
 
+/// A closed play, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayRecord {
+    pub id: i64,
+    pub track_id: i64,
+    pub source_id: Option<i64>,
+    pub started_at: i64,
+    pub played_ms: i64,
+    pub completed: bool,
+}
+
+/// The source the engine should try first for a track.
+///
+/// MVP: local files only, so `uri` is a filesystem path. When remote providers land it becomes
+/// whatever the provider's `open_stream` accepts, still resolved here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackSource {
+    pub source_id: i64,
+    pub track_id: i64,
+    pub provider: String,
+    pub uri: String,
+    pub duration_ms: Option<i64>,
+}
+
 #[derive(Debug)]
 pub struct Store {
     pub(crate) conn: Connection,
@@ -198,6 +222,125 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(hits)
+    }
+
+    /// One track, by id.
+    pub fn track_hit(&self, track_id: i64) -> Result<Option<TrackHit>> {
+        let hit = self
+            .conn
+            .query_row(
+                "SELECT t.id, t.title, ar.name, al.title, t.duration_ms
+                 FROM tracks t
+                 JOIN artists ar ON ar.id = t.artist_id
+                 LEFT JOIN albums al ON al.id = t.album_id
+                 WHERE t.id = ?1",
+                [track_id],
+                |row| {
+                    Ok(TrackHit {
+                        track_id: row.get(0)?,
+                        title: row.get(1)?,
+                        artist: row.get(2)?,
+                        album: row.get(3)?,
+                        duration_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(hit)
+    }
+
+    /// The best available source for `track_id`.
+    ///
+    /// Source preference is a setting in the MVP, so this is deliberately blunt: local files
+    /// first, then anything else that is still marked available.
+    pub fn playback_source(&self, track_id: i64) -> Result<Option<PlaybackSource>> {
+        let source = self
+            .conn
+            .query_row(
+                "SELECT id, track_id, provider, provider_track_id, duration_ms
+                 FROM track_sources
+                 WHERE track_id = ?1 AND available = 1
+                 ORDER BY provider = 'local' DESC, match_confidence DESC, id
+                 LIMIT 1",
+                [track_id],
+                |row| {
+                    Ok(PlaybackSource {
+                        source_id: row.get(0)?,
+                        track_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        uri: row.get(3)?,
+                        duration_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(source)
+    }
+
+    /// Replace the persisted queue with `track_ids`, in order.
+    pub fn save_queue(&mut self, track_ids: &[i64]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM queue_items", [])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO queue_items (position, track_id) VALUES (?1, ?2)")?;
+            for (position, track_id) in track_ids.iter().enumerate() {
+                stmt.execute(params![position as i64, track_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The persisted queue, in order.
+    pub fn load_queue(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT track_id FROM queue_items ORDER BY position")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Start a play row; returns its id so it can be finished later.
+    pub fn start_play(&mut self, track_id: i64, source_id: Option<i64>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO plays (track_id, source_id, started_at, played_ms, completed)
+             VALUES (?1, ?2, ?3, 0, 0)",
+            params![track_id, source_id, now_unix()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Close a play row opened by [`Store::start_play`].
+    pub fn finish_play(&mut self, play_id: i64, played_ms: i64, completed: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE plays SET played_ms = ?2, completed = ?3 WHERE id = ?1",
+            params![play_id, played_ms.max(0), completed],
+        )?;
+        Ok(())
+    }
+
+    /// Recent plays, newest first.
+    pub fn history(&self, limit: usize) -> Result<Vec<PlayRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, track_id, source_id, started_at, played_ms, completed
+             FROM plays ORDER BY started_at DESC, id DESC LIMIT ?1",
+        )?;
+        let records = stmt
+            .query_map([limit as i64], |row| {
+                Ok(PlayRecord {
+                    id: row.get(0)?,
+                    track_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    started_at: row.get(3)?,
+                    played_ms: row.get(4)?,
+                    completed: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(records)
     }
 
     pub(crate) fn reindex(conn: &Connection, track_id: i64) -> Result<()> {
@@ -301,6 +444,88 @@ mod tests {
         assert_eq!(store.search("harbour!", 10).unwrap().len(), 2);
         assert!(store.search("   ", 10).unwrap().is_empty());
         assert!(store.search("harbour", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn queue_survives_a_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        seed(&store);
+        assert!(store.load_queue().unwrap().is_empty());
+
+        store.save_queue(&[2, 1]).unwrap();
+        assert_eq!(store.load_queue().unwrap(), vec![2, 1]);
+
+        // Saving replaces, never appends.
+        store.save_queue(&[1]).unwrap();
+        assert_eq!(store.load_queue().unwrap(), vec![1]);
+        store.save_queue(&[]).unwrap();
+        assert!(store.load_queue().unwrap().is_empty());
+    }
+
+    #[test]
+    fn playback_source_prefers_local_and_skips_unavailable() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO track_sources (id, track_id, provider, provider_track_id,
+                   available, match_confidence)
+                   VALUES (1, 1, 'subsonic', '12345', 1, 1.0),
+                          (2, 1, 'local', '/music/night.flac', 1, 1.0);",
+            )
+            .unwrap();
+
+        let source = store.playback_source(1).unwrap().unwrap();
+        assert_eq!(source.provider, "local");
+        assert_eq!(source.uri, "/music/night.flac");
+
+        store
+            .conn
+            .execute("UPDATE track_sources SET available = 0 WHERE id = 2", [])
+            .unwrap();
+        assert_eq!(
+            store.playback_source(1).unwrap().unwrap().provider,
+            "subsonic"
+        );
+
+        store
+            .conn
+            .execute("UPDATE track_sources SET available = 0", [])
+            .unwrap();
+        assert!(store.playback_source(1).unwrap().is_none());
+        assert!(store.playback_source(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_play_is_opened_and_closed() {
+        let mut store = Store::open_in_memory().unwrap();
+        seed(&store);
+
+        let play_id = store.start_play(1, None).unwrap();
+        store.finish_play(play_id, 231_000, true).unwrap();
+
+        let (played, completed) = store
+            .conn
+            .query_row(
+                "SELECT played_ms, completed FROM plays WHERE id = ?1",
+                [play_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(played, 231_000);
+        assert!(completed);
+    }
+
+    #[test]
+    fn track_hit_returns_metadata_and_misses_cleanly() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+
+        let hit = store.track_hit(1).unwrap().unwrap();
+        assert_eq!(hit.title, "Night Ferry");
+        assert_eq!(hit.album.as_deref(), Some("Low Tide"));
+        assert!(store.track_hit(999).unwrap().is_none());
     }
 
     #[test]
