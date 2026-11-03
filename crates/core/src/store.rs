@@ -119,7 +119,7 @@ pub struct TrackHit {
 
 #[derive(Debug)]
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Store {
@@ -200,11 +200,8 @@ impl Store {
         Ok(hits)
     }
 
-    /// Insert or replace the FTS row for a track. Ingest calls this in the same
-    /// transaction as the track write.
-    #[allow(dead_code)] // first caller is the ingest pipeline, next commit
-    pub(crate) fn reindex_track(&self, track_id: i64) -> Result<()> {
-        self.conn.execute(
+    pub(crate) fn reindex(conn: &Connection, track_id: i64) -> Result<()> {
+        conn.execute(
             "INSERT OR REPLACE INTO tracks_fts(rowid, title, artist, album)
              SELECT t.id, t.title, ar.name, COALESCE(al.title, '')
              FROM tracks t
@@ -217,8 +214,15 @@ impl Store {
     }
 }
 
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before 1970")
+        .as_secs() as i64
+}
+
 /// Turn free text into a safe FTS5 query: alphanumeric terms, each prefix-matched.
-fn fts_expression(query: &str) -> String {
+pub(crate) fn fts_expression(query: &str) -> String {
     query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|term| !term.is_empty())
@@ -308,8 +312,8 @@ mod tests {
             .conn
             .execute_batch("UPDATE artists SET name = 'North Harbour' WHERE id = 1")
             .unwrap();
-        store.reindex_track(1).unwrap();
-        store.reindex_track(2).unwrap();
+        Store::reindex(&store.conn, 1).unwrap();
+        Store::reindex(&store.conn, 2).unwrap();
 
         let hits = store.search("north", 10).unwrap();
         assert_eq!(hits.len(), 2);

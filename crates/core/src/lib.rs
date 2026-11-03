@@ -5,6 +5,8 @@
 //! [`store::Store`] (the engine, on its own thread); readers get query results, never the
 //! connection.
 
+pub mod ingest;
+pub mod matching;
 pub mod model;
 pub mod store;
 
