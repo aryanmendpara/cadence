@@ -331,7 +331,7 @@ Engine state machine: `Stopped → Loading → Playing ⇄ Paused → (Ended →
 Each milestone must be runnable and tested before starting the next.
 
 **M0 — Gate, then scaffolding**
-0. **GPUI spike first, before anything else:** does `gpui` 0.2.2 + `gpui-component` 0.9 render a window on **stable** Rust on this machine? If it needs nightly: pin it in `rust-toolchain.toml`, add a note to §12, and **stop and report** before going further.
+0. **GPUI spike — passed (Nov 4 2026).** `gpui` 0.2.2 + `gpui-component` 0.9 build and render a window on stable Rust 1.99 (macOS 27.0, Xcode 27.2). Xcode needs the Metal Toolchain component (`xcodebuild -downloadComponent MetalToolchain`); without it the gpui build script fails compiling `shaders.metal`. No nightly pin needed.
 1. `git init` (this repo); Sonora checkout moved to `../sonora-ref`.
 2. Workspace with **only** these crates: `core`, `providers`, `provider-local`, `audio`, `engine`, `app` (package names `cadence-*`).
 3. Licences check (`deny.toml`, cargo-deny), CI (`cargo fmt --check`, `clippy -D warnings`, `cargo test`), `.gitignore`.
