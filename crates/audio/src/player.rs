@@ -2,8 +2,12 @@
 //!
 //! Everything runs on one thread; the caller talks to it with [`Command`]s and reads [`Event`]s.
 //! Nothing here blocks the audio callback.
+//!
+//! Gapless: the caller pre-loads the next track with [`Command::SetNext`]; when the current file
+//! ends, the worker swaps decoders and keeps feeding the same ring buffer, so there is no silence
+//! between tracks.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,11 +22,22 @@ const POSITION_INTERVAL: Duration = Duration::from_millis(200);
 /// Don't decode while the ring is this full (samples).
 const MIN_FREE_SAMPLES: usize = 8_192;
 
+/// One track to play, tagged with the caller's own id so events can refer to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackRequest {
+    pub path: PathBuf,
+    /// Opaque to the audio crate; echoed back in [`Event::Playing`].
+    pub id: u64,
+}
+
 /// What the caller asks the playback thread to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Load `path` and play it from the start.
-    Play(PathBuf),
+    /// Load this track and play it from the start, discarding anything already loaded.
+    Play(TrackRequest),
+    /// Pre-load the track that follows. The worker keeps it open and switches to it at the
+    /// exact end of the current one. `None` clears it.
+    SetNext(Option<TrackRequest>),
     Pause,
     Resume,
     Stop,
@@ -35,14 +50,15 @@ pub enum Command {
 /// What the playback thread reports back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A track opened successfully and is now playing.
+    /// A track started (or, mid-stream, that the next one took over).
     Playing {
+        id: u64,
         duration_ms: Option<u64>,
     },
     Paused,
     Resumed,
     Stopped,
-    /// The track reached its end; playback has stopped.
+    /// The queue ran dry; playback has stopped.
     Ended,
     Position {
         ms: u64,
@@ -123,17 +139,26 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
     }
 }
 
+/// A track waiting to take over.
+struct Prepared {
+    request: TrackRequest,
+    decoder: Decoder,
+}
+
 struct Worker {
     events: Sender<Event>,
     output: Option<Output>,
     decoder: Option<Decoder>,
     resampler: Option<Resampler>,
+    next: Option<Prepared>,
     /// Samples decoded but not yet accepted by the ring.
     pending: Vec<f32>,
     volume: f32,
-    /// Track position at the moment the output clock was last reset.
-    base_ms: u64,
-    /// Frames handed to the output since that reset.
+    /// Track position of the first frame currently in flight.
+    anchor_ms: u64,
+    /// Output clock reading when that frame was queued.
+    anchor_frames: u64,
+    /// Frames handed to the output since the last flush.
     pushed_frames: u64,
     playing: bool,
     finished: bool,
@@ -147,9 +172,11 @@ impl Worker {
             output: None,
             decoder: None,
             resampler: None,
+            next: None,
             pending: Vec::new(),
             volume: 1.0,
-            base_ms: 0,
+            anchor_ms: 0,
+            anchor_frames: 0,
             pushed_frames: 0,
             playing: false,
             finished: false,
@@ -161,9 +188,15 @@ impl Worker {
         let _ = self.events.send(event);
     }
 
+    fn fail(&mut self, message: String) {
+        self.send(Event::Error(message));
+        self.finished = true;
+    }
+
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Play(path) => self.play(&path),
+            Command::Play(request) => self.play(request),
+            Command::SetNext(request) => self.set_next(request),
             Command::Pause => {
                 if self.playing {
                     self.playing = false;
@@ -196,25 +229,23 @@ impl Worker {
         }
     }
 
-    fn play(&mut self, path: &Path) {
+    fn play(&mut self, request: TrackRequest) {
         self.reset();
         self.playing = false;
 
-        let decoder = match Decoder::open(path) {
+        let decoder = match Decoder::open(&request.path) {
             Ok(decoder) => decoder,
             Err(error) => {
                 self.send(Event::Error(error.to_string()));
                 return;
             }
         };
-        let duration_ms = decoder.duration_ms();
-
         if let Err(error) = self.ensure_output() {
             self.send(Event::Error(error.to_string()));
             return;
         }
-        let (device_rate, resume_error) = match self.output.as_ref() {
-            Some(output) => (output.rate(), output.resume().err()),
+        let resume_error = match self.output.as_ref() {
+            Some(output) => output.resume().err(),
             None => {
                 self.send(Event::Error("no output device".into()));
                 return;
@@ -224,6 +255,36 @@ impl Worker {
             self.send(Event::Error(error.to_string()));
             return;
         }
+        if let Some(output) = self.output.as_mut() {
+            output.flush();
+        }
+
+        self.playing = true;
+        self.last_position = Instant::now();
+        self.install(Prepared { request, decoder });
+    }
+
+    fn set_next(&mut self, request: Option<TrackRequest>) {
+        self.next = None;
+        let Some(request) = request else {
+            return;
+        };
+        if self.decoder.is_none() {
+            return;
+        }
+        match Decoder::open(&request.path) {
+            Ok(decoder) => self.next = Some(Prepared { request, decoder }),
+            Err(error) => self.send(Event::Error(error.to_string())),
+        }
+    }
+
+    /// Make `prepared` the current track. The consumer needs no gap: the ring is untouched.
+    fn install(&mut self, prepared: Prepared) -> bool {
+        let Prepared { request, decoder } = prepared;
+        let device_rate = match self.output.as_ref() {
+            Some(output) => output.rate(),
+            None => return false,
+        };
 
         self.resampler = if decoder.rate() == device_rate {
             None
@@ -231,23 +292,25 @@ impl Worker {
             match Resampler::new(decoder.rate(), device_rate) {
                 Ok(resampler) => Some(resampler),
                 Err(error) => {
-                    self.send(Event::Error(error.to_string()));
-                    return;
+                    self.fail(error.to_string());
+                    return false;
                 }
             }
         };
 
-        if let Some(output) = self.output.as_mut() {
-            output.flush();
-        }
-
-        self.base_ms = 0;
-        self.pushed_frames = 0;
-        self.finished = false;
+        let duration_ms = decoder.duration_ms();
         self.decoder = Some(decoder);
-        self.playing = true;
-        self.last_position = Instant::now();
-        self.send(Event::Playing { duration_ms });
+        self.anchor_ms = 0;
+        self.anchor_frames = self
+            .output
+            .as_ref()
+            .map_or(0, crate::output::Output::played_frames);
+        self.finished = false;
+        self.send(Event::Playing {
+            id: request.id,
+            duration_ms,
+        });
+        true
     }
 
     fn seek(&mut self, ms: u64) {
@@ -262,12 +325,13 @@ impl Worker {
             resampler.reset();
         }
         self.pending.clear();
-        self.base_ms = ms;
-        self.pushed_frames = 0;
         self.finished = false;
         if let Some(output) = self.output.as_mut() {
             output.flush();
         }
+        self.pushed_frames = 0;
+        self.anchor_ms = ms;
+        self.anchor_frames = 0;
         self.last_position = Instant::now();
         self.send(Event::Position { ms });
     }
@@ -288,6 +352,10 @@ impl Worker {
 
         loop {
             if self.pending.is_empty() {
+                if self.finished {
+                    self.finish_if_drained();
+                    return busy;
+                }
                 if self
                     .output
                     .as_ref()
@@ -295,17 +363,14 @@ impl Worker {
                 {
                     return busy;
                 }
-                match self.next_samples() {
-                    Some(samples) => self.pending = samples,
-                    None => {
-                        if self.finished {
-                            self.finish_if_drained();
-                        }
-                        return busy;
+                if !self.produce() {
+                    if self.finished {
+                        self.finish_if_drained();
                     }
+                    return busy;
                 }
                 if self.pending.is_empty() {
-                    return busy;
+                    continue;
                 }
             }
 
@@ -325,59 +390,75 @@ impl Worker {
         }
     }
 
-    /// One chunk of stereo samples, resampled and volume-adjusted.
-    fn next_samples(&mut self) -> Option<Vec<f32>> {
-        if self.finished {
-            return None;
+    /// Decode one chunk into `pending`, or hand over to the next track at end of file.
+    /// Returns `true` if it made progress.
+    fn produce(&mut self) -> bool {
+        if self.finished || self.decoder.is_none() {
+            return false;
         }
-        let chunk = match self.decoder.as_mut()?.next_chunk() {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => return self.tail(),
+        let chunk = match self.decoder.as_mut() {
+            Some(decoder) => decoder.next_chunk(),
+            None => return false,
+        };
+
+        match chunk {
+            Ok(Some(chunk)) => {
+                let samples = match self.resampler.as_mut() {
+                    Some(resampler) => match resampler.push(&chunk.samples) {
+                        Ok(samples) => samples,
+                        Err(error) => {
+                            self.fail(error.to_string());
+                            return false;
+                        }
+                    },
+                    None => chunk.samples,
+                };
+                self.push_samples(samples);
+                true
+            }
+            Ok(None) => {
+                // Flush the resampler's delay line before the next track takes over.
+                if let Some(tail) = self.take_tail() {
+                    self.push_samples(tail);
+                }
+                match self.next.take() {
+                    Some(prepared) => self.install(prepared),
+                    None => {
+                        self.finished = true;
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                self.fail(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn take_tail(&mut self) -> Option<Vec<f32>> {
+        let resampler = self.resampler.as_mut()?;
+        match resampler.flush() {
+            Ok(samples) => (!samples.is_empty()).then_some(samples),
             Err(error) => {
                 self.send(Event::Error(error.to_string()));
-                self.finished = true;
-                return None;
+                None
             }
-        };
-
-        let samples = match self.resampler.as_mut() {
-            Some(resampler) => match resampler.push(&chunk.samples) {
-                Ok(samples) => samples,
-                Err(error) => {
-                    self.send(Event::Error(error.to_string()));
-                    self.finished = true;
-                    return None;
-                }
-            },
-            None => chunk.samples,
-        };
-        Some(self.apply_volume(samples))
-    }
-
-    /// End of file: hand over whatever the resampler still holds, then mark the track finished.
-    fn tail(&mut self) -> Option<Vec<f32>> {
-        self.finished = true;
-        let samples = match self.resampler.as_mut() {
-            Some(resampler) => match resampler.flush() {
-                Ok(samples) => samples,
-                Err(error) => {
-                    self.send(Event::Error(error.to_string()));
-                    return None;
-                }
-            },
-            None => Vec::new(),
-        };
-        (!samples.is_empty()).then(|| self.apply_volume(samples))
-    }
-
-    fn apply_volume(&self, samples: Vec<f32>) -> Vec<f32> {
-        if (self.volume - 1.0).abs() < f32::EPSILON {
-            return samples;
         }
-        samples
-            .into_iter()
-            .map(|sample| (sample * self.volume).clamp(-1.0, 1.0))
-            .collect()
+    }
+
+    /// Append samples and apply gain to just those samples.
+    fn push_samples(&mut self, samples: Vec<f32>) {
+        if samples.is_empty() {
+            return;
+        }
+        let start = self.pending.len();
+        self.pending.extend(samples);
+        if (self.volume - 1.0).abs() >= f32::EPSILON {
+            for sample in &mut self.pending[start..] {
+                *sample = (*sample * self.volume).clamp(-1.0, 1.0);
+            }
+        }
     }
 
     fn finish_if_drained(&mut self) {
@@ -401,19 +482,20 @@ impl Worker {
         let Some(output) = self.output.as_ref() else {
             return;
         };
-        let played_ms = output.played_frames() * 1000 / u64::from(output.rate().max(1));
-        self.send(Event::Position {
-            ms: self.base_ms + played_ms,
-        });
+        let played = output.played_frames().saturating_sub(self.anchor_frames);
+        let ms = self.anchor_ms + played * 1000 / u64::from(output.rate().max(1));
+        self.send(Event::Position { ms });
     }
 
     /// Drop the decoder and buffered audio, keeping the device open.
     fn reset(&mut self) {
         self.decoder = None;
         self.resampler = None;
+        self.next = None;
         self.pending.clear();
         self.pushed_frames = 0;
-        self.base_ms = 0;
+        self.anchor_ms = 0;
+        self.anchor_frames = 0;
         self.finished = false;
         if let Some(output) = self.output.as_mut() {
             output.flush();

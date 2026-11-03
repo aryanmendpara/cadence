@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use cadence_audio::{Command, Event, Player};
+use cadence_audio::{Command, Event, Player, TrackRequest};
 use cadence_core::store::Store;
 use directories::ProjectDirs;
 
@@ -105,7 +105,7 @@ fn search(query: &str) -> Result<()> {
 /// The M2 harness: play a file through the real engine and report what it says.
 fn play(path: PathBuf, from_seconds: u64) -> Result<()> {
     let player = Player::new().context("starting the audio thread")?;
-    if !player.send(Command::Play(path)) {
+    if !player.send(Command::Play(TrackRequest { path, id: 0 })) {
         bail!("the audio thread stopped");
     }
     if from_seconds > 0 && !player.send(Command::Seek(from_seconds * 1_000)) {
@@ -115,7 +115,9 @@ fn play(path: PathBuf, from_seconds: u64) -> Result<()> {
     let mut duration_ms = None;
     loop {
         match player.recv_timeout(Duration::from_millis(250)) {
-            Some(Event::Playing { duration_ms: total }) => {
+            Some(Event::Playing {
+                duration_ms: total, ..
+            }) => {
                 duration_ms = total;
                 println!(
                     "playing{}",

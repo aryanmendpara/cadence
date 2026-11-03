@@ -11,7 +11,7 @@ mod player;
 mod resample;
 
 pub use decode::{Chunk, Decoder};
-pub use player::{Command, Event, Player};
+pub use player::{Command, Event, Player, TrackRequest};
 pub use resample::Resampler;
 
 use std::path::PathBuf;
