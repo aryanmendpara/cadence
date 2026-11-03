@@ -4,9 +4,12 @@
 //! This is the M1/M2 test surface from AGENTS.md — the GPUI app comes later and calls the
 //! same `cadence-core` API.
 
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use cadence_audio::{Command, Event, Player};
 use cadence_core::store::Store;
 use directories::ProjectDirs;
 
@@ -15,6 +18,7 @@ cadence <command>
 
   scan <folder>     index audio files into the library
   search <terms>    full-text search over title, artist and album
+  play <file> [s]   play one audio file until it ends (optionally from second s)
   help              show this message
 
 The database location can be overridden with CADENCE_DB.";
@@ -32,6 +36,16 @@ fn main() -> Result<()> {
                 bail!("search needs at least one term");
             }
             search(&query)
+        }
+        Some("play") => {
+            let path = args.get(1).context("play needs an audio file path")?;
+            let from = match args.get(2) {
+                Some(seconds) => seconds
+                    .parse::<u64>()
+                    .context("start time must be seconds")?,
+                None => 0,
+            };
+            play(PathBuf::from(path), from)
         }
         Some("help" | "-h" | "--help") | None => {
             println!("{USAGE}");
@@ -86,6 +100,52 @@ fn search(query: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The M2 harness: play a file through the real engine and report what it says.
+fn play(path: PathBuf, from_seconds: u64) -> Result<()> {
+    let player = Player::new().context("starting the audio thread")?;
+    if !player.send(Command::Play(path)) {
+        bail!("the audio thread stopped");
+    }
+    if from_seconds > 0 && !player.send(Command::Seek(from_seconds * 1_000)) {
+        bail!("the audio thread stopped");
+    }
+
+    let mut duration_ms = None;
+    loop {
+        match player.recv_timeout(Duration::from_millis(250)) {
+            Some(Event::Playing { duration_ms: total }) => {
+                duration_ms = total;
+                println!(
+                    "playing{}",
+                    total
+                        .map(|ms| format!(" ({})", clock(ms)))
+                        .unwrap_or_default()
+                );
+            }
+            Some(Event::Position { ms }) => {
+                let total = duration_ms.map(clock).unwrap_or_else(|| "--:--".into());
+                print!("\r{} / {total}  ", clock(ms));
+                std::io::stdout().flush().ok();
+            }
+            Some(Event::Paused) => println!("\rpaused        "),
+            Some(Event::Ended | Event::Stopped) => {
+                println!("\rdone           ");
+                return Ok(());
+            }
+            Some(Event::Error(error)) => {
+                println!();
+                bail!("{error}");
+            }
+            Some(_) | None => {}
+        }
+    }
+}
+
+fn clock(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 fn open_store() -> Result<Store> {

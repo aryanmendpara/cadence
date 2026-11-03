@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+cpal.workspace = true
+rubato.workspace = true
+rtrb.workspace = true
+symphonia = { workspace = true, features = ["mp3", "flac", "wav", "pcm", "aac", "isomp4", "ogg", "vorbis", "alac"] }
+thiserror.workspace = true

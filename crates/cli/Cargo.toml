@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+cadence-audio = { path = "../audio" }
 cadence-core = { path = "../core" }
 cadence-provider-local = { path = "../provider-local" }
 directories.workspace = true
