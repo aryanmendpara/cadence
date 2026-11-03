@@ -64,6 +64,7 @@ crates/
   engine/                  # player state machine, queue, glues core + providers + audio;
                            #   defines SecretStore and other platform-facing traits              (M0)
   app/                     # GPUI shell - thin, no business logic                                (M0)
+  cli/                     # headless harness: scan/search the library from a terminal            (M1)
   platform-macos/          # Now Playing, media keys, Keychain-backed SecretStore, hotkeys      (M3)
   provider-subsonic/       # Subsonic/Navidrome provider                                         (M4)
 ```

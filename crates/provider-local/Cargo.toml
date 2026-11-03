@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+cadence-core = { path = "../core" }
+lofty.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
